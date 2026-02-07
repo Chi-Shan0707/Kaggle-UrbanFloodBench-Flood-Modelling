@@ -81,19 +81,32 @@ Models/Model_2/train/
 
 ### 3. 开始训练
 
-1. 修改 `config.py` 确认 `model_id = 2`。
+1. 默认情况下 `config.py` 会根据 `model_id` 自动从对应的 `Models/Model_{id}/train/` 目录中选择 **所有事件** 并以 **8:2（train:val）** 划分：
+   - `model_id=1` → 使用 Model_1 的事件（全部分配，前 80% 用于训练，后 20% 用于验证）
+   - `model_id=2` → 使用 Model_2 的事件（同上）
+
+   如果你想手动指定事件集合，可以在 `TrainingConfig` 中传入 `train_events` / `val_events`：
+
+```python
+from config import TrainingConfig
+train_cfg = TrainingConfig(model_id=2)
+# 或者覆盖为自定义列表
+train_cfg.train_events = ['event_1', 'event_2', ...]
+train_cfg.val_events = ['event_80','event_81']
+```
+
 2. 运行训练脚本：
 
 ```bash
 python train.py
-
 ```
 
 脚本会自动执行以下步骤：
 
 * 加载并处理静态图结构 (保存为 `.pt` 文件)。
-* 计算训练集的水位标准差 (`std_manhole`, `std_cell`) 用于标准化 Loss。
+* 计算训练集的均值/标准差（动态特征归一化）并注入到训练流程中。注意：`train.py` 已修复 `compute_stats_from_events`，它现在同时兼容 `numpy.ndarray` 和 `torch.Tensor`，不会因数据类型不同而报错。
 * 开始自回归训练 (带 Teacher Forcing 衰减)。
+* 在验证集上计算验证损失并保存 `checkpoints/best_model.pt`（仅当验证损失比历史最好值更优时覆盖）。
 
 ### 4. 验证与测试
 
@@ -286,9 +299,24 @@ python train.py
 
 ### 4. Generate Submission
 
+Use the trained checkpoint to run inference and produce per-model prediction CSVs (one file per model):
+
 ```bash
-python inference.py --checkpoint ./checkpoints/best_model.pt --model_id 2 --output submission.csv
+python inference.py --checkpoint ./checkpoints/best_model.pt --model_id 2 --output submission_2.csv
 ```
+
+If you have multiple model outputs (e.g., `submission_1.csv`, `submission_2.csv`), the new helper `make_submission.py` can merge them into a Kaggle-ready submission aligned to the `sample_submission.csv` template.
+
+```bash
+# Example: merge prediction fragments and fill template
+python make_submission.py
+# Configure INPUT_FILES, SAMPLE_SUBMISSION_FILE, FINAL_OUTPUT_FILE at top of make_submission.py as needed
+```
+
+Notes:
+- `make_submission.py` performs a two-stage merge: it creates a compact intermediate file and then streams a final aligned submission using `sample_submission.csv` as the canonical template.
+- Missing values are filled with `0.0` and NaNs are corrected to `0.0` by default; summary stats are printed after completion.
+
 
 ## 📊 Data Processing
 

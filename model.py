@@ -72,9 +72,9 @@ class HeteroFloodGNN(nn.Module):
         self.update_conv = self._build_hetero_conv(config, gru_input_dim, config.hidden_dim)
         self.candidate_conv = self._build_hetero_conv(config, gru_input_dim, config.hidden_dim)
         
-        # ========== Decoder: hidden_dim → 1 (water level) ==========
-        self.manhole_decoder = self._build_mlp(config.hidden_dim, 1, config.decoder_layers)
-        self.cell_decoder = self._build_mlp(config.hidden_dim, 1, config.decoder_layers)
+        # ========== Decoder: hidden_dim → all dynamic features ==========
+        self.manhole_decoder = self._build_mlp(config.hidden_dim, manhole_dynamic_dim, config.decoder_layers)
+        self.cell_decoder = self._build_mlp(config.hidden_dim, cell_dynamic_dim, config.decoder_layers)
     
     def _build_mlp(self, in_dim: int, out_dim: int, hidden_layers: list) -> nn.Sequential:
         """Build a simple MLP with ReLU activations."""
@@ -197,24 +197,15 @@ class HeteroFloodGNN(nn.Module):
             h_dict = self._gru_step(x_dict, h_dict, edge_index_dict)
         
         # ========== Step 3: Decode ==========
-        pred_manhole_norm = self.manhole_decoder(h_dict['manhole'])  # [N_1d, 1]
-        pred_cell_norm = self.cell_decoder(h_dict['cell'])  # [N_2d, 1]
+        pred_manhole_norm = self.manhole_decoder(h_dict['manhole'])  # [N_1d, D1]
+        pred_cell_norm = self.cell_decoder(h_dict['cell'])  # [N_2d, D2]
 
-        # ==================== 【新增代码 START: 输出反归一化】 ====================
-        # 获取 water_level 的统计量 (假设它是第0个或第1个特征)
-        # 根据 dataset.py: Manhole [water, flow], Cell [rain, water, vol]
-        # Manhole Water Level is index 0
-        man_water_mean = self.man_dyn_mean[0]
-        man_water_std = self.man_dyn_std[0]
-        
-        # Cell Water Level is index 1
-        cell_water_mean = self.cell_dyn_mean[1]
-        cell_water_std = self.cell_dyn_std[1]
-        
-        # Y_real = Y_norm * Std + Mean
-        pred_manhole_real = pred_manhole_norm * man_water_std + man_water_mean
-        pred_cell_real = pred_cell_norm * cell_water_std + cell_water_mean
-        # ==================== 【新增代码 END】 ====================
+        # ==================== 【输出反归一化 - Multivariate】 ====================
+        # Denormalize all features: Y_real = Y_norm * Std + Mean
+        # Broadcasting: pred_norm [N, D] * std [D] + mean [D] -> [N, D]
+        pred_manhole_real = pred_manhole_norm * self.man_dyn_std + self.man_dyn_mean
+        pred_cell_real = pred_cell_norm * self.cell_dyn_std + self.cell_dyn_mean
+        # ==================== 【反归一化 END】 ====================
 
         pred_dict = {'manhole': pred_manhole_real, 'cell': pred_cell_real}
         
@@ -246,9 +237,9 @@ class HeteroFloodGNN(nn.Module):
             
             # Update dynamic features for autoregression
             manhole_dyn_t = manhole_dyn_t.clone()
-            manhole_dyn_t[:, 0] = pred_dict['manhole'].squeeze(-1)
-            
+           
+            manhole_dyn_t[:, 0] = pred_dict['manhole'][:, 0] # 明确取第0列
             cell_dyn_t = cell_dyn_t.clone()
-            cell_dyn_t[:, 1] = pred_dict['cell'].squeeze(-1)
+            cell_dyn_t[:, 1] = pred_dict['cell'][:, 1]
         
         return torch.stack(manhole_preds), torch.stack(cell_preds)

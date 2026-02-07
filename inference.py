@@ -141,39 +141,69 @@ def run_inference_stream(checkpoint_path: str, model_id: int, output_csv: str, d
                 cell_seq = event_data['cell'].to(device)
                 T = manhole_seq.shape[0]
                 
+                # Reset hidden state for event independence
                 h_dict = None
                 manhole_dyn_t = manhole_seq[0].clone()
                 cell_dyn_t = cell_seq[0].clone()
+                
+                # Warmup period: use ground truth for first 10 steps (0-9)
+                WARMUP_STEPS = 9
                 
                 # Buffer for current event results
                 event_rows = []
                 
                 # Inner loop with progress bar
                 for t in tqdm(range(T - 1), desc=f"  Ev {event_id}", leave=False):
+                    # 1. Forward Pass
                     pred_dict, h_dict = model(data, manhole_dyn_t, cell_dyn_t, h_dict)
                     
-                    # Predictions to CPU
-                    manhole_preds = pred_dict['manhole'].squeeze(-1).cpu().numpy()
-                    cell_preds = pred_dict['cell'].squeeze(-1).cpu().numpy()
+                    # 2. Extract Predictions (multivariate: [N, D])
+                    manhole_preds = pred_dict['manhole'].cpu().numpy()  # [N1, D1=2]
+                    cell_preds = pred_dict['cell'].cpu().numpy()  # [N2, D2=3]
+                    
+                    # --- Save ONLY water_level to CSV ---
+                    # Manhole: water_level is index 0
+                    manhole_water_levels = manhole_preds[:, 0]
+                    # Cell: water_level is index 1
+                    cell_water_levels = cell_preds[:, 1]
                     
                     # --- Collect Rows (Optimized) ---
                     # 1D Nodes
                     orig_indices_1d = data['manhole'].orig_idx.cpu().numpy()
-                    for idx, val in zip(orig_indices_1d, manhole_preds):
-                        # Placeholder row_id (-1), will fix later or ignore
+                    for idx, val in zip(orig_indices_1d, manhole_water_levels):
                         event_rows.append(f"-1,{model_id},{event_id},1,{idx},{val:.4f}")
                         
                     # 2D Nodes
                     orig_indices_2d = data['cell'].orig_idx.cpu().numpy()
-                    for idx, val in zip(orig_indices_2d, cell_preds):
+                    for idx, val in zip(orig_indices_2d, cell_water_levels):
                         event_rows.append(f"-1,{model_id},{event_id},2,{idx},{val:.4f}")
                     
-                    # Autoregressive Update
+                    # 3. Prepare Next Input (Hybrid Strategy)
                     if t < T - 2:
-                        manhole_dyn_t = manhole_seq[t+1].clone()
-                        cell_dyn_t = cell_seq[t+1].clone()
-                        manhole_dyn_t[:, 0] = pred_dict['manhole'].squeeze(-1)
-                        cell_dyn_t[:, 1] = pred_dict['cell'].squeeze(-1)
+                        if t < WARMUP_STEPS:
+                            # Phase A: Warmup (Steps 0-9)
+                            # Use full ground truth to align hidden state
+                            manhole_dyn_t = manhole_seq[t+1].clone()
+                            cell_dyn_t = cell_seq[t+1].clone()
+                        else:
+                            # Phase B: Autoregression (Steps 10+)
+                            # Use model predictions BUT inject true rainfall
+                            
+                            # Get model predictions (all features)
+                            next_man = pred_dict['manhole'].clone()  # [N1, D1=2]
+                            next_cell = pred_dict['cell'].clone()  # [N2, D2=3]
+                            
+                            # INJECT TRUE RAINFALL (Cell Index 0)
+                            # Ignore model's predicted rainfall, use CSV ground truth
+                            true_rainfall = cell_seq[t+1][:, 0]  # [N2]
+                            
+                            # Handle potential NaNs in test set rainfall
+                            mask = ~torch.isnan(true_rainfall)
+                            next_cell[mask, 0] = true_rainfall[mask]
+                            
+                            # Update inputs for next timestep
+                            manhole_dyn_t = next_man
+                            cell_dyn_t = next_cell
                 
                 # Write event rows to file immediately
                 if event_rows:

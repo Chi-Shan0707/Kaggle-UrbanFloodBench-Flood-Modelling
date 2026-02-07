@@ -30,52 +30,59 @@ logger = logging.getLogger(__name__)
 class StandardizedRMSELoss(nn.Module):
     """Compute Standardized RMSE loss for predictions.
     
-    RMSE is computed separately for each node type and normalized by
+    RMSE is computed separately for each feature and node type, normalized by
     pre-computed standard deviations.
     """
     
-    def __init__(self, std_manhole: float, std_cell: float):
+    def __init__(self, std_manhole: torch.Tensor, std_cell: torch.Tensor):
         super().__init__()
-        self.std_manhole = std_manhole
-        self.std_cell = std_cell
+        self.register_buffer('std_manhole', std_manhole)
+        self.register_buffer('std_cell', std_cell)
     
     def forward(self, pred_dict: Dict[str, torch.Tensor], 
                 target_dict: Dict[str, torch.Tensor],
                 mask_dict: Dict[str, torch.Tensor] = None) -> torch.Tensor:
         """
         Args:
-            pred_dict: {'manhole': [N1, 1], 'cell': [N2, 1]}
-            target_dict: {'manhole': [N1, 1], 'cell': [N2, 1]}
+            pred_dict: {'manhole': [N1, D1], 'cell': [N2, D2]}
+            target_dict: {'manhole': [N1, D1], 'cell': [N2, D2]}
             mask_dict: Optional masks for valid nodes
         
         Returns:
-            Averaged standardized RMSE across both node types
+            Physics-aware RMSE: Ignores rainfall prediction for cells
         """
         losses = []
         
-        # Manhole RMSE
-        pred_man = pred_dict['manhole'].squeeze(-1)
-        target_man = target_dict['manhole'].squeeze(-1)
+        # Manhole: Calculate Loss on ALL features (water_level, inlet_flow)
+        pred_man = pred_dict['manhole']  # [N1, D1=2]
+        target_man = target_dict['manhole']  # [N1, D1=2]
         if mask_dict and 'manhole' in mask_dict:
             mask = mask_dict['manhole']
             pred_man = pred_man[mask]
             target_man = target_man[mask]
         
-        rmse_man = torch.sqrt(torch.mean((pred_man - target_man) ** 2))
-        std_rmse_man = rmse_man / self.std_manhole
-        losses.append(std_rmse_man)
+        # Normalize by std and compute RMSE: [D1]
+        diff_man = (pred_man - target_man) / (self.std_manhole + 1e-6)
+        loss_man = torch.sqrt(torch.mean(diff_man ** 2, dim=0)).mean()
+        losses.append(loss_man)
         
-        # Cell RMSE
-        pred_cell = pred_dict['cell'].squeeze(-1)
-        target_cell = target_dict['cell'].squeeze(-1)
+        # Cell: Calculate Loss ONLY on water_level(1) and water_volume(2)
+        # IGNORE rainfall(0) - it's a known external forcing
+        pred_cell = pred_dict['cell']  # [N2, D2=3]
+        target_cell = target_dict['cell']  # [N2, D2=3]
         if mask_dict and 'cell' in mask_dict:
             mask = mask_dict['cell']
             pred_cell = pred_cell[mask]
             target_cell = target_cell[mask]
         
-        rmse_cell = torch.sqrt(torch.mean((pred_cell - target_cell) ** 2))
-        std_rmse_cell = rmse_cell / self.std_cell
-        losses.append(std_rmse_cell)
+        # Slice [:, 1:] to skip rainfall (index 0)
+        pred_cell_interest = pred_cell[:, 1:]  # [N2, 2] - water_level, water_volume
+        target_cell_interest = target_cell[:, 1:]  # [N2, 2]
+        std_cell_interest = self.std_cell[1:]  # [2] - std for level and volume only
+        
+        diff_cell = (pred_cell_interest - target_cell_interest) / (std_cell_interest + 1e-6)
+        loss_cell = torch.sqrt(torch.mean(diff_cell ** 2, dim=0)).mean()
+        losses.append(loss_cell)
         
         # Average across node types (equal weight)
         return torch.stack(losses).mean()
@@ -108,29 +115,30 @@ def compute_stats_from_events(dataset: UrbanFloodDataset, event_list: list) -> D
     logger.info(f"Stats computed. Manhole Water Std: {stats['man_std'][0]:.4f}")
     return stats
 
-def compute_std_from_events(dataset: UrbanFloodDataset, event_list: list, device: str) -> Tuple[float, float]:
-    """Compute standard deviations of water levels across training events."""
+def compute_std_from_events(dataset: UrbanFloodDataset, event_list: list, device: str) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute standard deviations of ALL dynamic features across training events."""
     logger.info("Computing standard deviations from training data...")
     
-    manhole_levels = []
-    cell_levels = []
-    
-    # 【注意】这里不需要 data = dataset.get(0)，因为我们只用 dataset.load_event
+    manhole_data = []
+    cell_data = []
     
     for event_name in tqdm(event_list, desc="Loading events for std"):
-        # 【修复】使用 dataset.load_event
         event_data = dataset.load_event(event_name)
         
-        # manhole_dyn: [T, N1, 2] where [:, :, 0] is water_level
-        manhole_levels.append(event_data['manhole'][:, :, 0].reshape(-1).numpy())
+        # manhole_dyn: [T, N1, D1=2] -> flatten to [T*N1, D1]
+        manhole_data.append(event_data['manhole'].reshape(-1, 2).numpy())
         
-        # cell_dyn: [T, N2, 3] where [:, :, 1] is water_level
-        cell_levels.append(event_data['cell'][:, :, 1].reshape(-1).numpy())
+        # cell_dyn: [T, N2, D2=3] -> flatten to [T*N2, D2]
+        cell_data.append(event_data['cell'].reshape(-1, 3).numpy())
     
-    std_manhole = float(np.concatenate(manhole_levels).std())
-    std_cell = float(np.concatenate(cell_levels).std())
+    # Concatenate all data and compute std per feature
+    all_manhole = np.concatenate(manhole_data, axis=0)  # [Total, D1]
+    all_cell = np.concatenate(cell_data, axis=0)  # [Total, D2]
     
-    logger.info(f"Computed std_manhole={std_manhole:.4f}, std_cell={std_cell:.4f}")
+    std_manhole = torch.from_numpy(all_manhole.std(axis=0).astype(np.float32))  # [D1]
+    std_cell = torch.from_numpy(all_cell.std(axis=0).astype(np.float32))  # [D2]
+    
+    logger.info(f"Computed std_manhole={std_manhole.tolist()}, std_cell={std_cell.tolist()}")
     
     return std_manhole, std_cell
 
@@ -180,10 +188,10 @@ def train_one_event(model: HeteroFloodGNN, data, event_data: Dict,
         # Predict next timestep
         pred_dict, h_dict = model(data, manhole_dyn_t, cell_dyn_t, h_dict)
         
-        # Ground truth for t+1
+        # Ground truth for t+1 (all features)
         target_dict = {
-            'manhole': manhole_seq[t+1, :, 0:1],  # water_level is first feature
-            'cell': cell_seq[t+1, :, 1:2]  # water_level is second feature for cells
+            'manhole': manhole_seq[t+1],  # [N1, D1] - all features
+            'cell': cell_seq[t+1]  # [N2, D2] - all features
         }
         
         # Compute loss
@@ -205,11 +213,10 @@ def train_one_event(model: HeteroFloodGNN, data, event_data: Dict,
                 # Use ground truth for next iteration
                 pass  # manhole_seq[t+1] already has ground truth
             else:
-                # Use model prediction for next iteration
-                # Update the water_level feature in the sequence
+                # Use model prediction for next iteration (all features)
                 # .detach() here prevents gradient flow through the input features of the next step
-                manhole_seq[t+1, :, 0] = pred_dict['manhole'].squeeze(-1).detach()
-                cell_seq[t+1, :, 1] = pred_dict['cell'].squeeze(-1).detach()
+                manhole_seq[t+1] = pred_dict['manhole'].detach()  # [N1, D1]
+                cell_seq[t+1] = pred_dict['cell'].detach()  # [N2, D2]
     
     return total_loss / (T - 1)
 
@@ -238,18 +245,16 @@ def validate_one_event(model: HeteroFloodGNN, data, event_data: Dict,
         pred_dict, h_dict = model(data, manhole_dyn_t, cell_dyn_t, h_dict)
         
         target_dict = {
-            'manhole': manhole_seq[t+1, :, 0:1],
-            'cell': cell_seq[t+1, :, 1:2]
+            'manhole': manhole_seq[t+1],  # [N1, D1] - all features
+            'cell': cell_seq[t+1]  # [N2, D2] - all features
         }
         
         loss = criterion(pred_dict, target_dict)
         total_loss += loss.item()
         
-        # Always use predictions for next step (autoregressive)
-        manhole_dyn_t = manhole_seq[t+1].clone()
-        cell_dyn_t = cell_seq[t+1].clone()
-        manhole_dyn_t[:, 0] = pred_dict['manhole'].squeeze(-1)
-        cell_dyn_t[:, 1] = pred_dict['cell'].squeeze(-1)
+        # Always use predictions for next step (autoregressive - all features)
+        manhole_dyn_t = pred_dict['manhole']  # [N1, D1]
+        cell_dyn_t = pred_dict['cell']  # [N2, D2]
     
     return total_loss / (T - 1)
 
