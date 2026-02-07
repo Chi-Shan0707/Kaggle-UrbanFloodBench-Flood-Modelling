@@ -1,0 +1,14 @@
+# === 核心计算框架 (你的环境版本) ===
+torch==2.9.1+cu130
+torchvision==0.24.1+cu130
+torch_geometric
+torch-scatter
+torch-sparse
+
+# === 数据处理 ===
+pandas>=1.5.0
+numpy>=1.23.0
+tqdm>=4.65.0
+
+# === 地理与数据处理 (Optional for GNN pipeline) ===
+# 建议通过 Conda 装 geopandas，这里列出是为了完整性

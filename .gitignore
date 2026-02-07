@@ -1,0 +1,139 @@
+# =========================
+# Global .gitignore for C++, Python, and DL projects
+# Target workspace: Kaggle / mixed C++ + Python + DL
+# Adjust as needed per subproject.
+
+# ---- C++ / Build Artifacts ----
+*.o
+*.obj
+*.lo
+*.la
+*.so
+*.dylib
+*.dll
+*.a
+*.lib
+*.exe
+*.out
+*.app
+*.asm
+*.s
+
+# Common build dirs
+build/
+build-*/
+bin/
+lib/
+dist/
+release/
+debug/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake-build-*/
+Testing/
+Makefile
+compile_commands.json
+install_manifest.txt
+_deps/
+
+# Ninja
+.ninja_log
+.ninja_deps
+
+# ---- Python / Packaging / Virtual Envs ----
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+.python-version
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+*.egg
+pip-wheel-metadata/
+
+# Caches / lint / test
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+coverage.xml
+
+# Jupyter
+.ipynb_checkpoints/
+
+# ---- Deep Learning / Experiments ----
+# Checkpoints / model weights
+checkpoints/
+models/
+weights/
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.h5
+*.tflite
+*.pb
+*.npz
+*.npy
+
+# Logs / experiment tracking
+logs/
+runs/
+lightning_logs/
+wandb/
+mlruns/
+.tensorboard-info/
+events.out.tfevents.*
+
+# Datasets (optional - comment out if you version data)
+data/
+datasets/
+
+# ---- IDE / Editor ----
+.vscode/
+.idea/
+*.code-workspace
+
+# ---- OS / Misc ----
+.DS_Store
+Thumbs.db
+ehthumbs.db
+*.swp
+*.swo
+*.orig
+*.bak
+
+# Generated outputs and artifacts
+outputs/
+# 常见大型模型/权重后缀（按需启用）
+*.ckpt
+*.pt
+*.pth
+*.h5
+
+
+/I’m Something of a Painter Myself/gan-getting-started/photo_jpg/
+/I’m Something of a Painter Myself/gan-getting-started/monet_jpg/
+
+*.7z
+*.tar
+*.zip
+*.png
+*.mp4
+*.csv
+
+
+
+info/
+processed/
