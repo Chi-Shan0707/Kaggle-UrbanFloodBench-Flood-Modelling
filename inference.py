@@ -223,7 +223,7 @@ def post_process_submission(output_csv: str):
 
 def main():
     parser = argparse.ArgumentParser(description="Inference for UrbanFloodBench (Memory Optimized)")
-    parser.add_argument("--checkpoint", type=str, required=True, 
+    parser.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt", 
                         help="Path to the model checkpoint")
     parser.add_argument("--model_id", type=int, required=True, 
                         help="Target Model ID (1 or 2)")

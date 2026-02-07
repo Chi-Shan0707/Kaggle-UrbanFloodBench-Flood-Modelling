@@ -65,9 +65,25 @@ class TrainingConfig:
     device: str = "cuda"  # or "cpu"
     
     def __post_init__(self):
-        if self.train_events is None:
-            # Default: use first 60 events for training
-            self.train_events = [f'event_{i}' for i in [1, 2, 3, 5, 6, 7, 9, 10]]
-        if self.val_events is None:
-            # Default: use next events for validation
-            self.val_events = [f'event_{i}' for i in [11, 12, 13]]
+    # 采用硬编码，分配event
+        # Model_1: 69 events (80% train, 20% validate)
+        # Model_2: 72 events (80% train, 20% validate)
+        model1_all_events = [1, 2, 3, 4, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 20, 21, 23, 24, 25, 27, 28, 30, 32, 34, 36, 38, 39, 40, 41, 43, 45, 46, 47, 49, 50, 54, 55, 56, 57, 58, 60, 61, 63, 64, 68, 70, 71, 72, 74, 76, 77, 78, 79, 82, 84, 85, 86, 87, 89, 90, 91, 92, 93, 94, 95, 96]
+        model2_all_events = [1, 2, 3, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 16, 19, 20, 21, 23, 24, 25, 26, 27, 28, 30, 32, 33, 34, 36, 38, 39, 40, 41, 43, 45, 46, 47, 48, 49, 50, 55, 56, 57, 58, 63, 64, 68, 69, 70, 71, 72, 74, 75, 78, 79, 80, 81, 83, 85, 86, 87, 89, 91, 92, 93, 94, 95, 96, 97, 98]
+        
+        if self.train_events is None or self.val_events is None:
+            if self.model_id == 1:
+                # Model_1: 69 events → ~55 train, ~14 validate
+                split_idx = int(len(model1_all_events) * 0.8)
+                train_list = model1_all_events[:split_idx]
+                val_list = model1_all_events[split_idx:]
+            else:  # model_id == 2
+                # Model_2: 72 events → ~57 train, ~15 validate
+                split_idx = int(len(model2_all_events) * 0.8)
+                train_list = model2_all_events[:split_idx]
+                val_list = model2_all_events[split_idx:]
+            
+            if self.train_events is None:
+                self.train_events = [f'event_{i}' for i in train_list]
+            if self.val_events is None:
+                self.val_events = [f'event_{i}' for i in val_list]

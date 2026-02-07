@@ -351,9 +351,9 @@ if __name__ == "__main__":
     )
     
     train_config = TrainingConfig(
-        model_id=2,
+        model_id=1,
         learning_rate=1e-3,
-        num_epochs=10,
+        num_epochs=16,
         teacher_forcing_ratio_start=1.0,
         teacher_forcing_ratio_end=0.2,
         device="cuda" if torch.cuda.is_available() else "cpu"
