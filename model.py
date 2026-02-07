@@ -46,7 +46,16 @@ class HeteroFloodGNN(nn.Module):
         self.config = config
         self.hidden_dim = config.hidden_dim
         self.num_recurrent_steps = config.num_recurrent_steps
-        
+
+        # ==================== 【新增代码 START】 ====================
+        # 注册归一化参数 (Buffer 会随模型保存，但不会被梯度更新)
+        # 初始化为 0均值 1标准差 (防止未注入参数时报错)
+        self.register_buffer('man_dyn_mean', torch.zeros(manhole_dynamic_dim))
+        self.register_buffer('man_dyn_std',  torch.ones(manhole_dynamic_dim))
+        self.register_buffer('cell_dyn_mean', torch.zeros(cell_dynamic_dim))
+        self.register_buffer('cell_dyn_std',  torch.ones(cell_dynamic_dim))
+        # ==================== 【新增代码 END】 ====================
+
         # Input dimensions: concatenate static + dynamic features
         manhole_input_dim = manhole_static_dim + manhole_dynamic_dim
         cell_input_dim = cell_static_dim + cell_dynamic_dim
@@ -156,10 +165,17 @@ class HeteroFloodGNN(nn.Module):
                 h_prev_dict: Dict[str, torch.Tensor] = None) -> Tuple[Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """Forward pass for one timestep prediction."""
         device = manhole_dyn.device
-        
+
+        # ==================== 【新增代码 START: 输入归一化】 ====================
+        # (X - Mean) / (Std + eps)
+        # 加上 1e-6 是为了防止除以 0
+        manhole_dyn_norm = (manhole_dyn - self.man_dyn_mean) / (self.man_dyn_std + 1e-6)
+        cell_dyn_norm = (cell_dyn - self.cell_dyn_mean) / (self.cell_dyn_std + 1e-6)
+        # ==================== 【新增代码 END】 ====================
+
         # ========== Step 1: Encode ==========
-        manhole_feats = torch.cat([data['manhole'].x_static.to(device), manhole_dyn], dim=-1)
-        cell_feats = torch.cat([data['cell'].x_static.to(device), cell_dyn], dim=-1)
+        manhole_feats = torch.cat([data['manhole'].x_static.to(device), manhole_dyn_norm], dim=-1)
+        cell_feats = torch.cat([data['cell'].x_static.to(device), cell_dyn_norm], dim=-1)
         
         x_manhole = self.manhole_encoder(manhole_feats)  # [N_1d, D]
         x_cell = self.cell_encoder(cell_feats)  # [N_2d, D]
@@ -181,10 +197,26 @@ class HeteroFloodGNN(nn.Module):
             h_dict = self._gru_step(x_dict, h_dict, edge_index_dict)
         
         # ========== Step 3: Decode ==========
-        pred_manhole = self.manhole_decoder(h_dict['manhole'])  # [N_1d, 1]
-        pred_cell = self.cell_decoder(h_dict['cell'])  # [N_2d, 1]
+        pred_manhole_norm = self.manhole_decoder(h_dict['manhole'])  # [N_1d, 1]
+        pred_cell_norm = self.cell_decoder(h_dict['cell'])  # [N_2d, 1]
+
+        # ==================== 【新增代码 START: 输出反归一化】 ====================
+        # 获取 water_level 的统计量 (假设它是第0个或第1个特征)
+        # 根据 dataset.py: Manhole [water, flow], Cell [rain, water, vol]
+        # Manhole Water Level is index 0
+        man_water_mean = self.man_dyn_mean[0]
+        man_water_std = self.man_dyn_std[0]
         
-        pred_dict = {'manhole': pred_manhole, 'cell': pred_cell}
+        # Cell Water Level is index 1
+        cell_water_mean = self.cell_dyn_mean[1]
+        cell_water_std = self.cell_dyn_std[1]
+        
+        # Y_real = Y_norm * Std + Mean
+        pred_manhole_real = pred_manhole_norm * man_water_std + man_water_mean
+        pred_cell_real = pred_cell_norm * cell_water_std + cell_water_mean
+        # ==================== 【新增代码 END】 ====================
+
+        pred_dict = {'manhole': pred_manhole_real, 'cell': pred_cell_real}
         
         return pred_dict, h_dict
     

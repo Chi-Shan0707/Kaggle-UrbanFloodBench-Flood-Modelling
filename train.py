@@ -80,6 +80,33 @@ class StandardizedRMSELoss(nn.Module):
         # Average across node types (equal weight)
         return torch.stack(losses).mean()
 
+def compute_stats_from_events(dataset: UrbanFloodDataset, event_list: list) -> Dict[str, torch.Tensor]:
+    """计算动态特征的均值和标准差."""
+    logger.info("Computing mean/std from training data...")
+    
+    man_data_list = []
+    cell_data_list = []
+    
+    for event_name in tqdm(event_list, desc="Loading stats"):
+        event_data = dataset.load_event(event_name)
+        # Flatten time and nodes dimensions: [T * N, D]
+        # 直接使用，因为 event_data['manhole'] 已经是 Tensor 了
+        man_data_list.append(event_data['manhole'].reshape(-1, event_data['manhole'].shape[-1]))
+        cell_data_list.append(event_data['cell'].reshape(-1, event_data['cell'].shape[-1]))
+    
+    # Concat all data
+    all_man = torch.cat(man_data_list, dim=0) # [Total_Samples, D1]
+    all_cell = torch.cat(cell_data_list, dim=0) # [Total_Samples, D2]
+    
+    stats = {
+        'man_mean': all_man.mean(dim=0),
+        'man_std': all_man.std(dim=0),
+        'cell_mean': all_cell.mean(dim=0),
+        'cell_std': all_cell.std(dim=0)
+    }
+    
+    logger.info(f"Stats computed. Manhole Water Std: {stats['man_std'][0]:.4f}")
+    return stats
 
 def compute_std_from_events(dataset: UrbanFloodDataset, event_list: list, device: str) -> Tuple[float, float]:
     """Compute standard deviations of water levels across training events."""
@@ -238,17 +265,13 @@ def train(model_config: ModelConfig, train_config: TrainingConfig):
     logger.info(f"Loading dataset for Model {train_config.model_id}...")
     dataset = UrbanFloodDataset(root="./", model_id=train_config.model_id)
     data = dataset.get(0)
-    
-    # Compute standard deviations if needed
-    if train_config.use_standardized_rmse:
-        std_manhole, std_cell = compute_std_from_events(
-            dataset, train_config.train_events, device
-        )
-        train_config.std_manhole = std_manhole
-        train_config.std_cell = std_cell
+
+    # ==================== 【新增代码 START】 ====================
+    # 计算并注入统计量
+    logger.info("Injecting normalization stats into model...")
+    stats = compute_stats_from_events(dataset, train_config.train_events)
     
     # Initialize model
-    logger.info("Initializing model...")
     model = HeteroFloodGNN(
         config=model_config,
         manhole_static_dim=4,  # depth, invert, surface, area
@@ -257,6 +280,23 @@ def train(model_config: ModelConfig, train_config: TrainingConfig):
         cell_dynamic_dim=3  # rainfall, water_level, water_volume
     ).to(device)
     
+    # 关键步骤：把计算出的 mean/std 复制到模型的 buffer 里
+    # 这样它们就会变成模型的一部分，随 model.pt 保存
+    model.man_dyn_mean.copy_(stats['man_mean'].to(device))
+    model.man_dyn_std.copy_(stats['man_std'].to(device))
+    model.cell_dyn_mean.copy_(stats['cell_mean'].to(device))
+    model.cell_dyn_std.copy_(stats['cell_std'].to(device))
+    # ==================== 【新增代码 END】 ====================
+
+    # Compute standard deviations if needed
+    if train_config.use_standardized_rmse:
+        std_manhole, std_cell = compute_std_from_events(
+            dataset, train_config.train_events, device
+        )
+        train_config.std_manhole = std_manhole
+        train_config.std_cell = std_cell
+    
+   
     logger.info(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Optimizer & Scheduler
@@ -352,7 +392,7 @@ if __name__ == "__main__":
     
     train_config = TrainingConfig(
         model_id=1,
-        learning_rate=1e-3,
+        learning_rate=1e-4,
         num_epochs=16,
         teacher_forcing_ratio_start=1.0,
         teacher_forcing_ratio_end=0.2,
