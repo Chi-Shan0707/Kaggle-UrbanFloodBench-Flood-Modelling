@@ -235,11 +235,11 @@ class HeteroFloodGNN(nn.Module):
             manhole_preds.append(pred_dict['manhole'])
             cell_preds.append(pred_dict['cell'])
             
-            # Update dynamic features for autoregression
-            manhole_dyn_t = manhole_dyn_t.clone()
-           
-            manhole_dyn_t[:, 0] = pred_dict['manhole'][:, 0] # 明确取第0列
-            cell_dyn_t = cell_dyn_t.clone()
-            cell_dyn_t[:, 1] = pred_dict['cell'][:, 1]
+            # Update dynamic features for autoregression (use full predictions)
+            manhole_dyn_t = pred_dict['manhole'].clone()
+            cell_dyn_t = pred_dict['cell'].clone()
+            
+            # Note: For true forecasting, rainfall should come from weather predictions
+            # This method assumes rainfall continues from last context value
         
         return torch.stack(manhole_preds), torch.stack(cell_preds)

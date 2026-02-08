@@ -22,7 +22,7 @@ class UrbanFloodDataset(InMemoryDataset):
         
         # 加载处理好的数据，显式允许加载复杂对象
         # 注意：这里会自动根据 split 加载对应的 .pt 文件
-        self.data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
+        self._data, self.slices = torch.load(self.processed_paths[0], weights_only=False)
 
     @property
     def raw_dir(self) -> str:
@@ -113,17 +113,37 @@ class UrbanFloodDataset(InMemoryDataset):
         if self.pre_transform is not None:
             data = self.pre_transform(data)
 
-        self.data, self.slices = self.collate([data])
+        self._data, self.slices = self.collate([data])
         
         # 创建 processed 目录并保存文件
         print(f"Saving processed graph to {self.processed_paths[0]}")
         os.makedirs(os.path.dirname(self.processed_paths[0]), exist_ok=True)
-        torch.save((self.data, self.slices), self.processed_paths[0])
+        torch.save((self._data, self.slices), self.processed_paths[0])
 
     def load_event(self, event_folder: str) -> Dict[str, torch.Tensor]:
         """Load dynamic sequences for a single event folder."""
         # 这里的 raw_dir 会根据 self.split 自动变为 .../train 或 .../test
+        """
+        加载动态序列数据。
+        优化逻辑：优先尝试读取 'event_data.pt'。如果不存在，则回退到读取 CSV（慢速模式）。
+        """
+        # 获取该 event 的绝对路径
         base = self.raw_dir
+        ev_base = os.path.join(base, event_folder)
+        
+        # ==========================================
+        # 🚀 极速通道：优先读取 .pt 文件
+        # ==========================================
+        pt_path = os.path.join(ev_base, 'event_data.pt')
+        
+        if os.path.exists(pt_path):
+            # 找到了预处理文件！直接加载，跳过后面几百行的 CSV 解析
+            # weights_only=False 是为了兼容字典格式读取
+            try:
+                data_dict = torch.load(pt_path, weights_only=False)
+                return data_dict
+            except Exception as e:
+                print(f"⚠️ 读取 {pt_path} 失败，将回退到 CSV 模式。错误: {e}")
         
         # 重新加载映射表
         manhoe_static_fp = os.path.join(base, '1d_nodes_static.csv')

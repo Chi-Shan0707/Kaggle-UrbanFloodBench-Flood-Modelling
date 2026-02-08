@@ -213,10 +213,15 @@ def train_one_event(model: HeteroFloodGNN, data, event_data: Dict,
                 # Use ground truth for next iteration
                 pass  # manhole_seq[t+1] already has ground truth
             else:
-                # Use model prediction for next iteration (all features)
-                # .detach() here prevents gradient flow through the input features of the next step
+                # Use model prediction for next iteration
+                # Inject real rainfall (Cell index 0) to maintain physical consistency
                 manhole_seq[t+1] = pred_dict['manhole'].detach()  # [N1, D1]
-                cell_seq[t+1] = pred_dict['cell'].detach()  # [N2, D2]
+                
+                next_cell = pred_dict['cell'].detach()  # [N2, D2]
+                # Preserve ground truth rainfall (index 0)
+                true_rainfall = cell_seq[t+1, :, 0].clone()
+                next_cell[:, 0] = true_rainfall
+                cell_seq[t+1] = next_cell
     
     return total_loss / (T - 1)
 
@@ -252,9 +257,13 @@ def validate_one_event(model: HeteroFloodGNN, data, event_data: Dict,
         loss = criterion(pred_dict, target_dict)
         total_loss += loss.item()
         
-        # Always use predictions for next step (autoregressive - all features)
+        # Always use predictions for next step BUT inject true rainfall
         manhole_dyn_t = pred_dict['manhole']  # [N1, D1]
-        cell_dyn_t = pred_dict['cell']  # [N2, D2]
+        
+        # Inject true rainfall for physical consistency
+        cell_dyn_t = pred_dict['cell'].clone()  # [N2, D2]
+        true_rainfall = cell_seq[t+1, :, 0]  # [N2]
+        cell_dyn_t[:, 0] = true_rainfall
     
     return total_loss / (T - 1)
 
@@ -311,6 +320,7 @@ def train(model_config: ModelConfig, train_config: TrainingConfig):
     
     # Loss function
     criterion = StandardizedRMSELoss(train_config.std_manhole, train_config.std_cell)
+    criterion = criterion.to(device)  # Move criterion buffers to device
     
     # Move data to device
     data = data.to(device)
@@ -396,9 +406,9 @@ if __name__ == "__main__":
     )
     
     train_config = TrainingConfig(
-        model_id=1,
+        model_id=2,
         learning_rate=1e-4,
-        num_epochs=16,
+        num_epochs=8,
         teacher_forcing_ratio_start=1.0,
         teacher_forcing_ratio_end=0.2,
         device="cuda" if torch.cuda.is_available() else "cpu"
