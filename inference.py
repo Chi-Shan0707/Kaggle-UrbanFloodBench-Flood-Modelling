@@ -1,275 +1,315 @@
 """Inference script for generating Kaggle submission file.
 
-Features:
-1. Loads a specific checkpoint for a specific Model ID.
-2. Fixes 'weights_only' error during torch.load.
-3. Intelligent Merge: Appends to existing submission file if it exists.
-4. **Memory Optimization**: Writes results to CSV incrementally (event by event) 
-   to avoid 'Killed' (OOM) errors.
-"""
-"""
-💡 核心改进点
-逐行写入 (Append Write)：每处理完 1 个 Event 的所有时间步，直接把数据转化为字符串写入硬盘，然后从内存中删除。
-这保证了内存占用只与单个 Event 的大小有关，而与 Event 总数无关。
+推理逻辑说明
+===========
+每个 test event 的时间轴结构:
 
-显式垃圾回收 (gc.collect)：每轮循环后强制清理 Python 垃圾对象和 PyTorch 显存缓存。
+  [t=0 ... t=context_len-1]  完整数据（真实 water_level/inlet_flow 已知）
+  [t=context_len ... t=T-1]  缺失数据（water_level/water_volume 为 NaN，需预测）
 
-字符串拼接优化：直接构建 CSV 格式的字符串列表 f"{...}"，比维护一个巨大的 Pandas DataFrame 更省内存。
+推理分两阶段:
+  Phase 1 – Context Warmup（t = 0 .. context_len-2）
+    - 以真实数据作为输入，逐步更新 GRU 隐状态
+    - 不收集预测结果（这些时间步是已知的，不需要提交）
 
-注意： 生成的文件中 row_id 暂时都是 -1。这是为了流式写入的效率。你需要最后单独运行一个简单的脚本（或者用 Pandas 打开再保存一次）来重置 row_id。
-如果你的内存足够加载最终的 CSV（通常几十 MB 到几百 MB），我在代码末尾留了一个 post_process_submission 函数，你可以取消注释或者单独调用它。
+  Phase 2 – Autoregressive Prediction（t = context_len-1 .. T-2）
+    - 从最后一个已知时间步 (context_len-1) 出发
+    - 每步将自身预测值滚动馈回作为下一步输入
+    - 始终将真实 rainfall 注入 cell 特征的第 0 维（降雨是外部强迫，永远可知）
+    - 收集每步的 water_level 预测值（manhole[:, 0], cell[:, 1]）
+
+与训练的一致性
+==============
+✓ 残差预测（delta）: model.forward() 内部完成，推理侧无需额外处理
+✓ 归一化 / 反归一化: model.forward() 内部通过 register_buffer 完成
+✓ 边数据: 模型接受的是静态 edge_index（在 data 中），动态边流量是输出而非输入
+✓ torch_scatter: 已替换为 PyTorch 原生 scatter_add_，推理阶段不涉及
+
+输出格式
+========
+每行: row_id, model_id, event_id, node_type, node_id, timestep_idx, water_level
+- timestep_idx: 该预测对应的时间步索引（context_len .. T-1），便于对齐与调试
+- 按 event、timestep、node 升序写入，确保 make_submission.py 的顺序对齐正确
 """
 
 import os
-import pandas as pd
-import torch
-from pathlib import Path
-from tqdm import tqdm
+import gc
 import logging
 import argparse
-import gc  # Garbage Collector
+from pathlib import Path
+
+import pandas as pd
+import torch
+from tqdm import tqdm
 
 from dataset import UrbanFloodDataset
 from model import HeteroFloodGNN
 from config import ModelConfig
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 辅助函数
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _detect_context_len(manhole_seq: torch.Tensor) -> int:
+    """检测每个 event 的 context 长度（非 NaN 的连续时间步数量）。
+
+    Args:
+        manhole_seq: [T, N1, D1] — manhole 动态特征序列，NaN 表示缺失目标时间步
+
+    Returns:
+        context_len: 从序列开头起连续非 NaN 的时间步数，至少为 1
+    """
+    # [T]: 每个时间步只要有任意 NaN 即视为缺失
+    is_nan = manhole_seq[:, :, 0].isnan().any(dim=1)   # [T] bool
+    nan_positions = is_nan.nonzero(as_tuple=False)
+    if len(nan_positions) == 0:
+        return manhole_seq.shape[0]   # 全部都是已知数据（训练集情况）
+    return int(nan_positions[0].item())
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 主推理函数
+# ─────────────────────────────────────────────────────────────────────────────
+
 def run_inference_stream(checkpoint_path: str, model_id: int, output_csv: str, device):
-    """Run inference and write to CSV incrementally to save memory."""
-    
-    # 1. Load Model
-    logger.info(f"Loading checkpoint from {checkpoint_path}")
+    """逐 event 流式推理并写入 CSV（内存安全版本）。
+
+    只输出「缺失时间步」（context_len .. T-1）的预测，不输出 warmup 期间的预测。
+    """
+
+    # ── 1. 加载模型 ──────────────────────────────────────────────────────────
+    logger.info(f"Loading checkpoint: {checkpoint_path}")
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except Exception as e:
         logger.error(f"Failed to load checkpoint: {e}")
-        raise e
+        raise
 
-    model_config = checkpoint['model_config']
-    
+    model_config: ModelConfig = checkpoint['model_config']
+
     model = HeteroFloodGNN(
         config=model_config,
         manhole_static_dim=4,
         cell_static_dim=6,
         manhole_dynamic_dim=2,
-        cell_dynamic_dim=3
+        cell_dynamic_dim=3,
     ).to(device)
-    
+
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
-    logger.info(f"Model {model_id} loaded. Epoch: {checkpoint.get('epoch', 'N/A')}")
-    
-    # 2. Setup Dataset
-    test_dir_path = Path(f"./Models/Model_{model_id}/test")
-    split_mode = 'test' if test_dir_path.exists() else 'train'
-    
-    if split_mode == 'train':
-        logger.warning(f"Test directory not found. Falling back to TRAIN data!")
+    logger.info(f"Model {model_id} loaded (epoch {checkpoint.get('epoch', 'N/A')})")
 
-    dataset = UrbanFloodDataset(root="./", model_id=model_id, split=split_mode)
-    
-    if not os.path.exists(dataset.processed_paths[0]):
-        logger.info(f"Processed graph for {split_mode} not found, processing now...")
-        try:
-            dataset.process()
-        except Exception as e:
-            logger.error(f"Failed to process dataset static files: {e}")
-            return
+    # ── 2. 初始化数据集 ───────────────────────────────────────────────────────
+    test_dir = Path(f"./Models/Model_{model_id}/test")
+    split = 'test' if test_dir.exists() else 'train'
+    if split == 'train':
+        logger.warning("Test directory not found — falling back to TRAIN split!")
 
-    # Load static graph to device
-    data = dataset.get(0).to(device)
-    
-    # 3. Prepare CSV File
-    # If file doesn't exist, write header. If exists, append.
-    # But for 'clean' inference of a model, we might want to start fresh or filter.
-    # Strategy: Write to a temporary file first, then merge? 
-    # Simpler Strategy: Just append to the main file immediately.
-    
+    dataset = UrbanFloodDataset(root="./", model_id=model_id, split=split)
+
+    # 将静态图加载到推理设备
+    static_data = dataset.get(0).to(device)
+
+    # orig_idx 保存节点在原始 CSV 中的全局索引（即 submission 中的 node_id）
+    orig_idx_1d = static_data['manhole'].orig_idx.cpu().numpy()  # [N1]
+    orig_idx_2d = static_data['cell'].orig_idx.cpu().numpy()     # [N2]
+
+    # ── 3. 收集 event 列表 ────────────────────────────────────────────────────
+    raw_dir = Path(dataset.raw_dir)
+    event_folders = sorted(
+        [d.name for d in raw_dir.iterdir() if d.is_dir() and 'event' in d.name]
+    )
+    logger.info(f"Found {len(event_folders)} events under {raw_dir} ({split})")
+
+    # ── 4. 跳过已处理的 events（断点续写）───────────────────────────────────
+    processed_events: set = set()
     file_exists = os.path.exists(output_csv)
-    
-    # Define columns
-    columns = ['row_id', 'model_id', 'event_id', 'node_type', 'node_id', 'water_level']
-    
-    # Identify events
-    target_dir = Path(dataset.raw_dir)
-    event_folders = sorted([d.name for d in target_dir.iterdir() if d.is_dir() and 'event' in d.name])
-    logger.info(f"Found {len(event_folders)} events for Model {model_id} in {split_mode} set")
-    
-    # Check existing events in CSV to avoid duplicates if re-running
-    processed_events = set()
     if file_exists:
-        # Read only model_id and event_id columns to save memory
         try:
             df_meta = pd.read_csv(output_csv, usecols=['model_id', 'event_id'])
-            # Filter for current model
             existing = df_meta[df_meta['model_id'] == model_id]
             processed_events = set(existing['event_id'].unique())
-            logger.info(f"Skipping {len(processed_events)} already processed events.")
+            logger.info(f"Resuming: skipping {len(processed_events)} already-done events")
         except Exception:
-            logger.warning("Could not read existing CSV metadata. Assuming fresh start for this model.")
+            logger.warning("Could not read existing CSV; starting fresh.")
 
-    # 4. Inference Loop
+    # ── 5. 推理主循环 ─────────────────────────────────────────────────────────
+    columns = ['row_id', 'model_id', 'event_id', 'node_type', 'node_id',
+               'timestep_idx', 'water_level']
     total_rows_written = 0
-    
-    # Open CSV in append mode
-    # buffer_size=0 ensures immediate write, though buffering is usually fine
+
     with open(output_csv, 'a') as f:
-        # If file is new, write header
         if not file_exists:
             f.write(','.join(columns) + '\n')
-            
+
         with torch.no_grad():
-            for event_name in tqdm(event_folders, desc=f"Model {model_id} Inference"):
+            for event_name in tqdm(event_folders, desc=f"Model {model_id}"):
+                # 解析 event_id
                 try:
                     event_id = int(event_name.split('_')[-1])
-                except:
+                except ValueError:
                     continue
-                
-                # Skip if already done
+
                 if event_id in processed_events:
                     continue
 
+                # ── 加载 event 数据 ─────────────────────────────────────────
                 try:
                     event_data = dataset.load_event(event_name)
                 except Exception as e:
-                    logger.error(f"⚠️ Error loading {event_name}: {e}")
+                    logger.error(f"Error loading {event_name}: {e}")
                     continue
 
-                manhole_seq = event_data['manhole'].to(device)
-                cell_seq = event_data['cell'].to(device)
-                T = manhole_seq.shape[0]
-                
-                # Reset hidden state for event independence
+                # 序列张量: [T, N, D]
+                manhole_seq: torch.Tensor = event_data['manhole'].to(device)  # [T, N1, 2]
+                cell_seq:    torch.Tensor = event_data['cell'].to(device)      # [T, N2, 3]
+                T: int = manhole_seq.shape[0]
+
+                # ── 检测 context 长度（动态，无需硬编码）────────────────────
+                # 测试集所有 event 均为 10，但保持动态以应对边缘情况
+                context_len = _detect_context_len(manhole_seq)
+                pred_steps  = T - context_len   # 需要预测的时间步数
+
+                if pred_steps <= 0:
+                    logger.debug(f"{event_name}: all {T} steps are context, skip.")
+                    continue
+
+                logger.debug(
+                    f"{event_name}: T={T}, context={context_len}, predict={pred_steps}"
+                )
+
+                # ── Phase 1: Context Warmup ────────────────────────────────
+                # 用真实数据逐步建立 GRU 隐状态（t = 0 .. context_len-2）
+                # 共运行 context_len-1 次前向传播；不收集预测输出
                 h_dict = None
-                manhole_dyn_t = manhole_seq[0].clone()
-                cell_dyn_t = cell_seq[0].clone()
-                
-                # Warmup period: use ground truth for first 10 steps (0-9)
-                WARMUP_STEPS = 9
-                
-                # Buffer for current event results
+                for t in range(context_len - 1):
+                    _, h_dict, _ = model(
+                        static_data,
+                        manhole_seq[t],   # [N1, 2] 真实值
+                        cell_seq[t],      # [N2, 3] 真实值（含真实 rainfall）
+                        h_dict,
+                    )
+                    # 截断隐状态计算图（推理无需梯度）
+                    h_dict = {k: v.detach() for k, v in h_dict.items()}
+
+                # ── Phase 2: Autoregressive Prediction ────────────────────
+                # 从最后一个已知时间步 context_len-1 的真实值出发
+                manhole_dyn_t = manhole_seq[context_len - 1].clone()  # [N1, 2]
+                cell_dyn_t    = cell_seq[context_len - 1].clone()      # [N2, 3]
+
                 event_rows = []
-                
-                # Inner loop with progress bar
-                for t in tqdm(range(T - 1), desc=f"  Ev {event_id}", leave=False):
-                    # 1. Forward Pass
-                    pred_dict, h_dict = model(data, manhole_dyn_t, cell_dyn_t, h_dict)
-                    
-                    # 2. Extract Predictions (multivariate: [N, D])
-                    manhole_preds = pred_dict['manhole'].cpu().numpy()  # [N1, D1=2]
-                    cell_preds = pred_dict['cell'].cpu().numpy()  # [N2, D2=3]
-                    
-                    # --- Save ONLY water_level to CSV ---
-                    # Manhole: water_level is index 0
-                    manhole_water_levels = manhole_preds[:, 0]
-                    # Cell: water_level is index 1
-                    cell_water_levels = cell_preds[:, 1]
-                    
-                    # --- Collect Rows (Optimized) ---
-                    # 1D Nodes
-                    orig_indices_1d = data['manhole'].orig_idx.cpu().numpy()
-                    for idx, val in zip(orig_indices_1d, manhole_water_levels):
-                        event_rows.append(f"-1,{model_id},{event_id},1,{idx},{val:.4f}")
-                        
-                    # 2D Nodes
-                    orig_indices_2d = data['cell'].orig_idx.cpu().numpy()
-                    for idx, val in zip(orig_indices_2d, cell_water_levels):
-                        event_rows.append(f"-1,{model_id},{event_id},2,{idx},{val:.4f}")
-                    
-                    # 3. Prepare Next Input (Hybrid Strategy)
-                    if t < T - 2:
-                        if t < WARMUP_STEPS:
-                            # Phase A: Warmup (Steps 0-9)
-                            # Use full ground truth to align hidden state
-                            manhole_dyn_t = manhole_seq[t+1].clone()
-                            cell_dyn_t = cell_seq[t+1].clone()
-                        else:
-                            # Phase B: Autoregression (Steps 10+)
-                            # Use model predictions BUT inject true rainfall
-                            
-                            # Get model predictions (all features)
-                            next_man = pred_dict['manhole'].clone()  # [N1, D1=2]
-                            next_cell = pred_dict['cell'].clone()  # [N2, D2=3]
-                            
-                            # INJECT TRUE RAINFALL (Cell Index 0)
-                            # Ignore model's predicted rainfall, use CSV ground truth
-                            true_rainfall = cell_seq[t+1][:, 0]  # [N2]
-                            
-                            # Handle potential NaNs in test set rainfall
-                            mask = ~torch.isnan(true_rainfall)
-                            next_cell[mask, 0] = true_rainfall[mask]
-                            
-                            # Update inputs for next timestep
-                            manhole_dyn_t = next_man
-                            cell_dyn_t = next_cell
-                
-                # Write event rows to file immediately
+
+                for t in range(context_len - 1, T - 1):
+                    # model.forward() 内部:
+                    #   ① 归一化输入 (register_buffer man_dyn_mean/std, cell_dyn_mean/std)
+                    #   ② Encoder → GRU-GNN (reset/update/candidate gates) → Decoder
+                    #   ③ 残差预测: pred_norm = x_norm + delta_norm
+                    #   ④ 反归一化输出到真实物理单位
+                    # 返回 3-tuple; cell_to_cell_flow（边流量）推理时丢弃
+                    pred_dict, h_dict, _ = model(
+                        static_data,
+                        manhole_dyn_t,
+                        cell_dyn_t,
+                        h_dict,
+                    )
+                    h_dict = {k: v.detach() for k, v in h_dict.items()}
+
+                    # 该步预测对应的时间步索引（context_len .. T-1）
+                    predicted_ts = t + 1
+
+                    # 提取 water_level（提交所需特征）
+                    # Manhole D1=[water_level, inlet_flow]      → index 0
+                    # Cell    D2=[rainfall, water_level, water_volume] → index 1
+                    man_wl  = pred_dict['manhole'][:, 0].cpu().numpy()   # [N1]
+                    cell_wl = pred_dict['cell'][:, 1].cpu().numpy()      # [N2]
+
+                    # 构建 CSV 行（1D 节点）
+                    for idx, val in zip(orig_idx_1d, man_wl):
+                        event_rows.append(
+                            f"-1,{model_id},{event_id},1,{idx},{predicted_ts},{val:.6f}"
+                        )
+                    # 构建 CSV 行（2D 节点）
+                    for idx, val in zip(orig_idx_2d, cell_wl):
+                        event_rows.append(
+                            f"-1,{model_id},{event_id},2,{idx},{predicted_ts},{val:.6f}"
+                        )
+
+                    # ── 准备下一步自回归输入 ────────────────────────────────
+                    # Manhole: 直接使用模型预测（无可注入的已知特征）
+                    manhole_dyn_t = pred_dict['manhole'].clone()     # [N1, 2]
+
+                    # Cell: 使用模型预测，但注入已知的真实 rainfall
+                    # 测试集中 rainfall（cell[:, 0]）在所有时间步均无 NaN
+                    next_cell = pred_dict['cell'].clone()             # [N2, 3]
+                    if predicted_ts < T:
+                        # 用真实降雨替换模型预测的降雨（外部大气强迫，已知）
+                        next_cell[:, 0] = cell_seq[predicted_ts][:, 0]
+                    cell_dyn_t = next_cell
+
+                # ── 写入磁盘 ────────────────────────────────────────────────
                 if event_rows:
                     f.write('\n'.join(event_rows) + '\n')
                     total_rows_written += len(event_rows)
-                
-                # Cleanup Memory
+
+                # ── 清理显存 ────────────────────────────────────────────────
                 del event_rows, manhole_seq, cell_seq, h_dict, pred_dict
                 torch.cuda.empty_cache()
                 gc.collect()
 
-    logger.info(f"Inference complete. Added {total_rows_written} rows.")
+    logger.info(f"Inference complete. Total rows written: {total_rows_written:,}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 后处理：重置 row_id（可选）
+# ─────────────────────────────────────────────────────────────────────────────
 
 def post_process_submission(output_csv: str):
-    """Sort and assign correct row_ids for the final submission."""
-    logger.info("Post-processing submission file (Sorting & Re-indexing)...")
-    
-    # This might still be heavy if file is huge, but much better than holding tensors
+    """对推理输出文件重置 row_id（从 0 开始连续编号）。
+
+    注意：此步骤会将整个文件读入内存。
+    如果文件超过可用内存，请改用 make_submission.py 进行最终对齐。
+    """
+    logger.info("Post-processing: resetting row_id ...")
     try:
-        # Chunk processing could be better, but sorting requires full data.
-        # Assuming the final CSV fits in RAM (it's just text/numbers, no graphs).
         df = pd.read_csv(output_csv)
-        
-        # Sort: Model -> Event -> Node Type -> Node ID -> Timestep (implied by file order? No, need explicit)
-        # Wait, previous logic didn't save timestep index. 
-        # Kaggle requires ordering by timestep? 
-        # "rows are arranged in ascending order of the timesteps by default"
-        
-        # NOTE: My stream writer didn't save timestep_index to save space/logic complexity.
-        # But pandas read might shuffle? No, CSV read preserves order.
-        # Since we wrote t=0, t=1... sequentially, the file IS ordered by timestep locally per event.
-        # We just need to ensure Model/Event order.
-        
-        # Actually, to be safe, let's just rely on the write order if we ran Model 1 then Model 2.
-        # But strictly, we should assign row_id.
-        
-        # Let's just reset the row_id column strictly from 0 to N
         df['row_id'] = range(len(df))
-        
-        # Save back
         df.to_csv(output_csv, index=False)
-        logger.info(f"✅ Final submission saved to {output_csv}")
-        
+        logger.info(f"Done. {len(df):,} rows saved to {output_csv}")
     except Exception as e:
-        logger.error(f"Post-processing failed (Low RAM?): {e}")
-        logger.warning("The submission file exists but row_ids might be -1. You may need a stronger machine to sort it.")
+        logger.error(f"Post-processing failed: {e}")
+        logger.warning("Submission exists but row_ids are -1. Use make_submission.py to align.")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CLI 入口
+# ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Inference for UrbanFloodBench (Memory Optimized)")
-    parser.add_argument("--checkpoint", type=str, default="checkpoints/best_model.pt", 
-                        help="Path to the model checkpoint")
-    parser.add_argument("--model_id", type=int, required=True, 
+    parser = argparse.ArgumentParser(
+        description="UrbanFloodBench inference — only predicts missing timesteps"
+    )
+    parser.add_argument("--checkpoint", default="checkpoints/best_model.pt",
+                        help="Path to model checkpoint (.pt)")
+    parser.add_argument("--model_id", type=int, required=True,
                         help="Target Model ID (1 or 2)")
-    parser.add_argument("--output", type=str, default="submission.csv", 
-                        help="Path to the submission CSV file")
-    
+    parser.add_argument("--output", default="submission.csv",
+                        help="Output CSV path (appended if exists)")
+    parser.add_argument("--postprocess", action="store_true",
+                        help="Reset row_id to sequential integers after inference")
     args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    # Run Stream Inference
+    logger.info(f"Device: {device}")
+
     run_inference_stream(args.checkpoint, args.model_id, args.output, device)
-    
-    # Optional: Clean up row_ids at the end
-    # Only run this if you are sure this is the LAST model you are running
-    # Or run a separate script to fix row_ids later
-    # post_process_submission(args.output) 
+
+    if args.postprocess:
+        post_process_submission(args.output)
+
 
 if __name__ == "__main__":
     main()

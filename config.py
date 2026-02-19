@@ -34,7 +34,7 @@ class TrainingConfig:
     """Training loop hyperparameters."""
     
     # Data
-    model_id: int = 2
+    model_id: int = 1
     train_events: List[str] = None  # e.g. ['event_1', 'event_2', ...]
     val_events: List[str] = None
     

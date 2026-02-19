@@ -77,13 +77,15 @@ def test_model(data):
         manhole_dyn = event_data['manhole'][0]  # First timestep
         cell_dyn = event_data['cell'][0]
         
-        pred_dict, h_dict = model(data, manhole_dyn, cell_dyn)
+        # forward 返回 3-tuple: (pred_dict, h_dict, cell_to_cell_flow)
+        pred_dict, h_dict, cell_flow = model(data, manhole_dyn, cell_dyn)
         
         print(f"\n✓ Forward pass successful")
         print(f"  - Manhole predictions: {pred_dict['manhole'].shape}")
         print(f"  - Cell predictions: {pred_dict['cell'].shape}")
         print(f"  - Manhole hidden state: {h_dict['manhole'].shape}")
         print(f"  - Cell hidden state: {h_dict['cell'].shape}")
+        print(f"  - Cell→Cell edge flow: {cell_flow.shape}  (隐式边流量预测)")
         
         # Test sequence prediction
         print(f"\n✓ Testing sequence prediction...")
