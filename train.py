@@ -617,7 +617,7 @@ if __name__ == "__main__":
     )
     
     train_config = TrainingConfig(
-        model_id=2,
+        model_id=1,
         learning_rate=1e-4,
         num_epochs=8,
         teacher_forcing_ratio_start=1.0,

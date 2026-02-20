@@ -1,11 +1,24 @@
 
 # UrbanFloodBench GNN 训练流水线
 <!-- 此文档记录代码模块间的完整关联逻辑、环境配置与使用方法 -->
+<a name="chinese"></a>
+
+<div align="center">
+
+[English](#english) | [中文](#中文)
+</div>
+
+
+# 中文
 
 
 这是一个基于 **几何深度学习 (Geometric Deep Learning)** 的模块化流水线，专为时空城市洪水预测设计。它使用异构图神经网络 (HeteroGNN) 来模拟地下管网与地表漫流的耦合系统。
 
+
 ## 🎯 问题概述 
+
+**比赛分数**: Score: 0.3840  
+**比赛链接**: [Kaggle Urban Flood Modelling Leaderboard](https://www.kaggle.com/competitions/urban-flood-modelling/leaderboard)
 
 - **1D 节点 (Manholes)**: 地下排水管网。
 - **2D 节点 (Cells)**: 地表地形网格。水流在此汇聚，通过耦合连接流入地下。
@@ -13,14 +26,11 @@
 
 ## 🏗️ 架构设计
 
-```mermaid
-graph LR
-    Input[静态 + 动态特征] --> Encoder[类型专用 MLP]
-    Encoder --> Processor[循环 GNN (GRU + HeteroConv)]
-    Processor --> Decoder[类型专用 MLP]
-    Decoder --> Output[下一时刻水位预测]
-
 ```
+静态 + 动态特征 → Encoder (类型专用 MLP) → Processor (循环 GNN: GRU + HeteroConv) → Decoder (类型专用 MLP) → 下一时刻水位预测
+```
+
+
 
 ### 关键组件
 
@@ -306,6 +316,7 @@ Loss = 0.5 * (RMSE_manhole / std_manhole) + 0.5 * (RMSE_cell / std_cell)
 
 ---
 
+<a name="english"></a>
 ### Model Architecture Upgrades (DUALFloodGNN Inspired)
 
 本节记录了受 **DUALFloodGNN** 论文启发、对模型架构与训练流程所做的四项核心升级。每项改进都直接针对自回归洪水预测任务中已知的痛点，并通过代码层面的具体实现加以落地。
@@ -453,7 +464,7 @@ pip install torch==2.9.1+cu130 --index-url https://download.pytorch.org/whl/cu13
 ```
 
 
-# UrbanFloodBench GNN Training Pipeline
+# English
 
 A robust, modular **Geometric Deep Learning** pipeline for spatio-temporal urban flood forecasting using Heterogeneous Graph Neural Networks (HeteroGNN).
 
